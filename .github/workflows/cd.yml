@@ -1,15 +1,14 @@
-name: CD Pipeline
+name: CD — Deploy to ECS
 
 on:
   workflow_dispatch:
     inputs:
-
       version:
-        description: 'Docker image version'
+        description: 'ECR image tag from CI (example: v1.0.0)'
         required: true
-
+        type: string
       environment:
-        description: 'Deployment environment'
+        description: 'GitHub Environment / ECS service'
         required: true
         type: choice
         options:
@@ -21,35 +20,97 @@ permissions:
   contents: read
   id-token: write
 
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'ap-south-1' }}
+  ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY || 'spring-cicd' }}
+
 jobs:
-
   deploy:
-
+    name: Deploy ${{ inputs.version }} to ${{ inputs.environment }}
     runs-on: ubuntu-latest
-
-    environment:
-      name: ${{ inputs.environment }}
+    environment: ${{ inputs.environment }}
 
     steps:
-
-      - name: Configure AWS
+      - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ap-south-1
+          aws-region: ${{ env.AWS_REGION }}
 
-      - name: Verify Docker Image
+      - name: Verify image exists in ECR
         run: |
           aws ecr describe-images \
-            --repository-name textellent \
-            --image-ids imageTag=${{ inputs.version }}
+            --repository-name "${ECR_REPOSITORY}" \
+            --image-ids imageTag="${{ inputs.version }}"
 
-      - name: Deploy
+      - name: Resolve image URI
+        id: image
         run: |
-          echo "Deploying ${{ inputs.version }}"
-          echo "Environment ${{ inputs.environment }}"
+          REGISTRY=$(aws ecr describe-repositories \
+            --repository-names "${ECR_REPOSITORY}" \
+            --query 'repositories[0].repositoryUri' \
+            --output text)
+          IMAGE="${REGISTRY}:${{ inputs.version }}"
+          echo "uri=${IMAGE}" >> "$GITHUB_OUTPUT"
+          echo "Deploying ${IMAGE}"
 
-          # fetch ECS task definition
-          # update image
-          # register new revision
-          # update ECS service
+      - name: Fetch current task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition "${{ vars.ECS_TASK_FAMILY }}" \
+            --query taskDefinition \
+            --output json \
+          | jq 'del(
+              .taskDefinitionArn,
+              .revision,
+              .status,
+              .requiresAttributes,
+              .compatibilities,
+              .registeredAt,
+              .registeredBy,
+              .deregisteredAt
+            )' > task-definition.json
+
+      - name: Render task definition with new image
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: ${{ vars.ECS_CONTAINER_NAME }}
+          image: ${{ steps.image.outputs.uri }}
+
+      - name: Deploy to Amazon ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          service: ${{ vars.ECS_SERVICE }}
+          cluster: ${{ vars.ECS_CLUSTER }}
+          wait-for-service-stability: true
+
+      - name: Print public URL
+        run: |
+          TASK_ARN=$(aws ecs list-tasks \
+            --cluster "${{ vars.ECS_CLUSTER }}" \
+            --service-name "${{ vars.ECS_SERVICE }}" \
+            --desired-status RUNNING \
+            --query 'taskArns[0]' \
+            --output text)
+
+          if [ -z "$TASK_ARN" ] || [ "$TASK_ARN" = "None" ]; then
+            echo "No running task found"
+            exit 1
+          fi
+
+          ENI=$(aws ecs describe-tasks \
+            --cluster "${{ vars.ECS_CLUSTER }}" \
+            --tasks "$TASK_ARN" \
+            --query 'tasks[0].attachments[0].details[?name==`networkInterfaceId`].value' \
+            --output text)
+
+          IP=$(aws ec2 describe-network-interfaces \
+            --network-interface-ids "$ENI" \
+            --query 'NetworkInterfaces[0].Association.PublicIp' \
+            --output text)
+
+          echo "Deployed ${{ inputs.version }} to ${{ inputs.environment }}"
+          echo "URL: http://${IP}:8080/api/hello"
