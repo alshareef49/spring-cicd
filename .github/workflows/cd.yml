@@ -1,0 +1,55 @@
+name: CD Pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+
+      version:
+        description: 'Docker image version'
+        required: true
+
+      environment:
+        description: 'Deployment environment'
+        required: true
+        type: choice
+        options:
+          - dev
+          - staging
+          - production
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+
+  deploy:
+
+    runs-on: ubuntu-latest
+
+    environment:
+      name: ${{ inputs.environment }}
+
+    steps:
+
+      - name: Configure AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ap-south-1
+
+      - name: Verify Docker Image
+        run: |
+          aws ecr describe-images \
+            --repository-name textellent \
+            --image-ids imageTag=${{ inputs.version }}
+
+      - name: Deploy
+        run: |
+          echo "Deploying ${{ inputs.version }}"
+          echo "Environment ${{ inputs.environment }}"
+
+          # fetch ECS task definition
+          # update image
+          # register new revision
+          # update ECS service

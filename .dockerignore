@@ -1,0 +1,7 @@
+.git
+.github
+docs
+target
+.idea
+*.md
+HELP.md
